@@ -286,7 +286,8 @@ void searchGit_worker(char* path, const char* gitModelPath, char* relPath, const
 		if(!S_ISDIR(st.st_mode))
 			continue;
 
-		dirList[pos] = strdup(dp->d_name);
+		dirList[pos] = malloc(strlen(dp->d_name)+1);
+		strcpy(dirList[pos], dp->d_name);
 		pos++;
 	}
 
@@ -498,7 +499,7 @@ void makmak_searchbaselibs_worker(const char *originallib, const char *curlib,
 							//skip this ovm file
 							continue;
 						}
-						/** recursive deepining - search for ph **/
+						/** recursive deepening - search for ph **/
 						makmak_searchbaselibs_worker(originallib, ph, devModelPath, gitModelPath, sysModelPath,
 								devLibs, numDevLibs, gitLibs, gitRelPath, numGitLibs, sysLibs, numSysLibs);
 						free(ph);
@@ -567,8 +568,8 @@ void makmak_searchbaselibs_worker(const char *originallib, const char *curlib,
 					}
 				}
 				/* inside of gitLibs */
-				for(i=0; i<*numSysLibs; i++) {
-					if( !strcmp(curlib, gitLibs[i]+(strlen(gitLibs[i])-1-strlen(curlib))) ) {
+				for(i=0; i<*numGitLibs; i++) {
+					if( !strcmp(curlib, gitLibs[i]) ) {
 						return;
 					}
 				}

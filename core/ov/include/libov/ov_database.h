@@ -40,8 +40,8 @@ extern "C" {
 *	Maximum size of a database file
 */
 #ifndef OV_DATABASE_MAXSIZE
- #define OV_DATABASE_MAXSIZE	2147483648     //   2 GByte 
-//#define OV_DATABASE_MAXSIZE	524288000UL    // 500 MByte 
+ #define OV_DATABASE_MAXSIZE	2147483648UL	//   2 GByte
+//#define OV_DATABASE_MAXSIZE	524288000UL		// 500 MByte
 #endif
 
 
@@ -60,6 +60,15 @@ extern "C" {
 	helpname = (OV_STRING)malloc(strlen(varname)+strlen(getenv("ACPLT_HOME"))+2); \
 	sprintf(helpname, "%s%s%s", getenv("ACPLT_HOME"), FOLDER_DELIMITER, varname); \
 	varname = helpname
+
+/*
+ * option defines for loading database
+ */
+#define OV_DBOPT_VERBOSE		0x01		/*	output info while loading/unloading	*/
+#define OV_DBOPT_BACKUP			0x02		/*	flag that backup is being loaded	*/
+#define OV_DBOPT_FORCECREATE	0x04		/*	force to create new database	*/
+#define OV_DBOPT_NOMAP			0x08		/*	disable mapping of database	*/
+#define OV_DBOPT_NOFILE			0x10		/*	no db file	*/
 
 /*		
  *	List structure for objectId -> object-pointer relation
@@ -200,34 +209,28 @@ OV_RESULT ov_database_idListGetRelationIndex(const OV_UINT idH, const OV_UINT id
 */
 OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	OV_STRING	filename,
-	OV_UINT		size
+	OV_UINT		size,
+	OV_UINT		flags
 );
 
 /*
-*	Map an existing database
+*	Load an existing database part 1
 */
-OV_DLLFNCEXPORT OV_RESULT ov_database_map(
+OV_DLLFNCEXPORT OV_RESULT ov_database_loadfile(
 	OV_STRING	filename
 );
 
 /*
-*	Map an existing database part 1
+*	Load an existing database part 2
 */
-OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadfile(
-	OV_STRING	filename
-);
-
-/*
-*	Map an existing database part 2
-*/
-OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadlib(
+OV_DLLFNCEXPORT OV_RESULT ov_database_loadlib(
 	OV_STRING	filename
 );
 
 /*
 *	Unmap the database
 */
-OV_DLLFNCEXPORT void ov_database_unmap(void);
+OV_DLLFNCEXPORT void ov_database_unload(void);
 
 /*
 *	Flush the contents of a database
@@ -238,6 +241,11 @@ OV_DLLFNCEXPORT void ov_database_flush(void);
 *	Write the contents of a database to a backupfile
 */
 OV_DLLFNCEXPORT OV_RESULT ov_database_write(OV_STRING dbname);
+
+/*
+*	Load database
+*/
+OV_DLLFNCEXPORT OV_RESULT ov_database_load(OV_STRING filename,OV_UINT size, OV_UINT flags);
 
 /*
 *	Initialize the database (subroutine)
@@ -303,7 +311,7 @@ OV_DLLFNCEXPORT OV_UINT ov_database_getfrag(void);
 *	Move the database to a new base address (subroutine)
 */
 OV_RESULT ov_database_move(
-	const OV_INT	distance
+	const OV_PTRDIFF	distance
 );
 
 #ifdef __cplusplus

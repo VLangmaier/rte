@@ -276,6 +276,8 @@ static void ov_server_usage(void)
             	"                                 queue that matches concerning IDENTIFIER,\n"
             	"                                 CLASS and LIBRARY before starting the server."
             	"                                 All parameters are mandatory. Use '/' as wildcard.\n"
+				"--no-map                         Do not map database.\n"
+				"--force-create                   Force to create a new database\n"
             	"-h, --help                       Display this help message\n");
 #else
 		fprintf(stderr, "No help output implemented for this server. Sorry.");
@@ -294,13 +296,13 @@ int main(int argc, char **argv) {
 	*	local variables
 	*/
 
-	OV_STRING	            filename = NULL;	/*	malloced	*/
-	OV_STRING	            servername = NULL;	/*	malloced	*/
+	OV_STRING				filename = NULL;	/*	malloced	*/
+	OV_STRING				servername = NULL;	/*	malloced	*/
 	OV_STRING				configFile	=	NULL;	/*	not malloced	*/
 	OV_STRING				configBasePath	=	NULL;	/*	obtained from the path of the configfile	*/ /*	malloced	*/
-	OV_STRING	            password = NULL;	/*	malloced	*/
-	OV_STRING               libraries[MAX_STARTUP_LIBRARIES];	/*	items malloced	*/
-	OV_INT		            libcount;
+	OV_STRING				password = NULL;	/*	malloced	*/
+	OV_STRING				libraries[MAX_STARTUP_LIBRARIES];	/*	items malloced	*/
+	OV_INT					libcount;
 	OV_STRING				helper = NULL;						/*	malloced and freed locally or copied to other variable	*/
 	OV_STRING				execIdent = NULL;	/*	malloced	*/
 	OV_STRING				execClass = NULL;	/*	malloced	*/
@@ -312,11 +314,13 @@ int main(int argc, char **argv) {
 	OV_UINT					hlpindex = 0;
 	OV_BOOL					logfileSpecified = FALSE;
 	OV_BOOL					exec = FALSE;
-	OV_INSTPTR_ov_library   plib;
-	OV_INSTPTR_ov_domain    pdom;
-	OV_INT                  i;
-	OV_RESULT	            result;
-	OV_INT 		            port = 0; /* KS_ANYPORT */
+	OV_INSTPTR_ov_library	plib;
+	OV_INSTPTR_ov_domain	pdom;
+	OV_INT					i;
+	OV_RESULT				result;
+	OV_INT					port = 0; /* KS_ANYPORT */
+	OV_UINT					size = 0; /* database size */
+	OV_UINT					dbflags = OV_DBOPT_VERBOSE; /* database options flags */
 	OV_UINT					maxAllowedJitter = 0;
 	OV_UINT					ks_maxItemsPerRequest = 0;
 	OV_UINT					maxStringLength = 0;
@@ -324,9 +328,9 @@ int main(int argc, char **argv) {
 	OV_UINT					maxNameLength = 0;
 	OV_UINT					maxHierarchyDepth = 0;
 	OV_ANY					tempAny = {{OV_VT_VOID, {0}}, 0, {0,0}};
-	OV_BOOL		            startup = TRUE;
-	int	   	            exit_status = EXIT_SUCCESS;
-	OV_BOOL		        exit = FALSE;
+	OV_BOOL					startup = TRUE;
+	int						exit_status = EXIT_SUCCESS;
+	OV_BOOL					exit = FALSE;
 
 #if OV_SYSTEM_RMOS
 	OV_UINT		            taskid;
@@ -446,7 +450,7 @@ int main(int argc, char **argv) {
 				 * e.g. SERVERNAME ov_server1
 				 *
 				 * recognized options are:
-				 * DBFILE		path to database file
+				 * DBFILE		path to database file. set to '-' to use no database
 				 * SERVERNAME	name of this ov_server
 				 * ID			Ticket Identification for server access
 				 * PORT			server port number
@@ -466,8 +470,11 @@ int main(int argc, char **argv) {
 				 * KSMAXSTRLENGTH	maximum length of strings to process with ks
 				 * KSMAXVECLENGTH	maximum length of vectors to process with ks
 				 * KSMAXITEMSPERREQ	maximum number of items per ks-request
-				 * DBSIZE		ignored. only for dbutil
-				 * DBUTILLOG	ignored. only for dbutil
+				 * DBSIZE			db size when need to create
+				 * DBUTILLOG		ignored. only for dbutil
+				 * DBNOMAP			read database but do not map
+				 * DBFORCECREATE	force creation of a new database
+				 * 					old database file is removed
 				 */
 
 				cfFile = fopen(configFile, "r");
@@ -858,8 +865,23 @@ int main(int argc, char **argv) {
 					}
 					/*	DBSIZE	*/
 					else if(strstr(startRead, "DBSIZE")==startRead)
-					{/*	ignored --> only for dbutil	*/
-						;
+					{
+						temp = readValue(startRead);
+						if(!temp || !*temp)
+							return EXIT_FAILURE;
+						if(!size)
+							size = strtoul(temp, NULL, 0);
+						free(temp);
+					}
+					/*	DBNOMAP	*/
+					else if(strstr(startRead, "DBNOMAP")==startRead)
+					{
+						dbflags |= OV_DBOPT_NOMAP;
+					}
+					/*	DBFORCECREATE	*/
+					else if(strstr(startRead, "DBFORCECREATE")==startRead)
+					{
+						dbflags |= OV_DBOPT_FORCECREATE;
 					}
 					/*	DBUTILLOG	*/
 					else if(strstr(startRead, "DBUTILLOG")==startRead)
@@ -884,8 +906,8 @@ int main(int argc, char **argv) {
 					fclose(cfFile);
 					return EXIT_FAILURE;
 				}
+				fclose(cfFile);
 			}
-			fclose(cfFile);
 		}
 		/*
 		*	set port number option
@@ -1136,6 +1158,18 @@ int main(int argc, char **argv) {
 				goto HELP;
 			}
 		}
+		/*
+		 *	set no map flag
+		 */
+		else if(!strcmp(argv[i], "--no-map")) {
+			dbflags |= OV_DBOPT_NOMAP;
+		}
+		/*
+		 *	set force create flag
+		 */
+		else if(!strcmp(argv[i], "--force-create")) {
+			dbflags |= OV_DBOPT_FORCECREATE;
+		}
 
 		/*
 		*	display help option
@@ -1244,7 +1278,7 @@ HELP:		ov_server_usage();
 	if(!(filename[1]==':'|| filename[0]=='\\'))
 #endif
 	{/*	relative path --> prepend basePath	*/
-		if(configBasePath && *configBasePath)
+		if(configBasePath && *configBasePath && strcmp(filename, "-")!=0)
 		{
 			hlpindex = strlen(configBasePath);
 			helper = calloc(hlpindex+strlen(filename)+2, sizeof(char));
@@ -1270,24 +1304,23 @@ HELP:		ov_server_usage();
 			filename = helper;
 		}
 	}
-	ov_logfile_info("Mapping database \"%s\"...", filename);
 
 #ifdef OV_CATCH_EXCEPTIONS
 	result = ov_supervised_database_map(filename);
 #else
-	result = ov_database_map(filename);
+	//result = ov_database_map(filename);
+	result = ov_database_load(filename, size, dbflags);
 #endif
 	if (Ov_Fail(result) && db_backup_filename) {
 MAPBACKUP:
 		ov_backup = TRUE;
 		ov_logfile_error("Error: %s (error code 0x%4.4x).",
 		ov_result_getresulttext(result), result);
-		ov_logfile_info("Mapping backup-database \"%s\"...", db_backup_filename);
 
 #ifdef OV_CATCH_EXCEPTIONS
 		result = ov_supervised_database_map(db_backup_filename);
 #else
-		result = ov_database_map(db_backup_filename);
+		result = ov_database_load(db_backup_filename, size, dbflags|OV_DBOPT_BACKUP);
 #endif
 	}
 	if(Ov_Fail(result)) {
@@ -1298,7 +1331,6 @@ ERRORMSG:
 		ov_vendortree_free();
 		return EXIT_FAILURE;
 	}
-	ov_logfile_info("Database mapped.");
 
 	/*
 	 * set the commandline options
@@ -1381,7 +1413,6 @@ ERRORMSG:
 	*	start up the database if appropriate
 	*/
 	if(startup) {
-		ov_logfile_info("Starting up database...");
 #ifdef OV_CATCH_EXCEPTIONS
 		result = ov_supervised_database_startup();
 #else
@@ -1391,7 +1422,6 @@ ERRORMSG:
 			if ((!ov_backup) && (db_backup_filename)) goto MAPBACKUP;
 			goto ERRORMSG;
 		}
-		ov_logfile_info("Database started up.");
 	}
 	/*
 	*	create startup libraries
@@ -1455,9 +1485,7 @@ ERRORMSG:
 	*/
 
 	if(startup) {
-		ov_logfile_info("Shutting down database...");
 		ov_database_shutdown();
-		ov_logfile_info("Database shut down.");
 	}
 
 	/*
@@ -1472,10 +1500,8 @@ ERRORMSG:
 	*   unmap the database
 	*/
 
-	ov_logfile_info("Unmapping database \"%s\"...", filename);
-	ov_database_unmap();
+	ov_database_unload();
 	free(filename);
-	ov_logfile_info("Database unmapped.");
 
 	free(servername);
 	free(commandline_options);

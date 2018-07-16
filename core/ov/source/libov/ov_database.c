@@ -40,6 +40,28 @@
 #include "libov/ov_macros.h"
 #include "libov/ov_logfile.h"
 
+#if OV_SYNC_PTHREAD
+#include <pthread.h>
+static pthread_mutex_t databaseMutex = PTHREAD_MUTEX_INITIALIZER;
+#define database_mutex_init()
+#define database_mutex_destroy()
+#define database_mutex_lock() pthread_mutex_lock(&databaseMutex)
+#define database_mutex_unlock() pthread_mutex_unlock(&databaseMutex)
+
+#elif OV_SYNC_NTMUTEX
+#include <windows.h>
+static HANDLE databaseMutex = NULL;
+#define database_mutex_init() databaseMutex = CreateMutexA(NULL, FALSE, NULL)
+#define database_mutex_destroy() CloseHandle(databaseMutex)
+#define database_mutex_lock() WaitForSingleObject(databaseMutex, INFINITE)
+#define database_mutex_unlock() ReleaseMutex(databaseMutex)
+
+#else
+#define database_mutex_lock()
+#define database_mutex_unlock()
+#define database_mutex_init()
+#define database_mutex_destroy()
+#endif
 
 #if OV_SYSTEM_SOLARIS
 #include "/usr/ucbinclude/sys/file.h"
@@ -107,22 +129,23 @@ int flock_solaris (int filedes, int oper)
 *	Global variable: database pointer, file handles and stuff
 */
 OV_DLLVAREXPORT OV_DATABASE_INFO OV_MEMSPEC	*pdb = NULL;
+OV_UINT		dbFlags = 0;
 
 #if OV_SYSTEM_UNIX
-static int			fd;
+static int			fd = 0;
 #endif
 
 #if OV_SYSTEM_NT
-static HANDLE		hfile;
-static HANDLE		hmap;
+static HANDLE		hfile = NULL;
+static HANDLE		hmap = NULL;
 #endif
 
 #if OV_SYSTEM_RMOS
-FILE				*file;
+FILE				*file = NULL;
 #endif
 
 #if OV_SYSTEM_OPENVMS
-unsigned short		channel;
+unsigned short		channel = 0;
 #endif
 
 #if OV_SYSTEM_MC164
@@ -180,6 +203,7 @@ __ml_ptr ov_database_morecore(
 	char	null = 0;
 #endif
 #endif
+
 	/*
 	*	test if we can get/release memory
 	*/
@@ -624,7 +648,8 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_idListRelease(const OV_UINT idH, const OV_
 
 OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	OV_STRING	filename,
-	OV_UINT		size /* TODO_ADJUST_WHEN_LARGE_DB */
+	OV_UINT		size, /* TODO_ADJUST_WHEN_LARGE_DB */
+	OV_UINT		flags
 ) {
 	/*
 	*	local variables
@@ -644,26 +669,60 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	unsigned long	status;
 #endif
 	/*
+	 * update database flags
+	 */
+	if(flags)
+		dbFlags = flags;
+	/*
 	*	check parameters
 	*/
 	if(pdb) {
 		return OV_ERR_GENERIC;
 	}
+
 	// TODO_ADJUST_WHEN_LARGE_DB
-	if(!size || (size > (OV_UINT) OV_DATABASE_MAXSIZE) || !filename) {
+	if(!size || (size > (OV_UINT) OV_DATABASE_MAXSIZE) || (!filename&&!(dbFlags&(OV_DBOPT_NOFILE|OV_DBOPT_NOMAP)))) {
 		return OV_ERR_BADPARAM;
 	}
+
+	if((dbFlags&OV_DBOPT_VERBOSE)){
+		if(dbFlags&(OV_DBOPT_NOMAP|OV_DBOPT_NOFILE)){
+			ov_logfile_info("Creating database in memory...");
+		} else {
+			ov_logfile_info("Creating database \"%s\" ...", filename);
+		}
+	}
+
 	/* Rundup file size */
 	size = ml_rundupFileSize(size);
-	
+
+	/*
+	 * check if we want to create database in memory
+	 */
+	if(dbFlags&(OV_DBOPT_NOMAP|OV_DBOPT_NOFILE)){
+#if OV_DYNAMIC_DATABASE
+		return OV_ERR_BADPARAM;
+#endif
+		pdb = Ov_HeapMalloc(size);
+		if(!pdb)
+			return OV_ERR_DBOUTOFMEMORY;
+	} else {
 #if !OV_SYSTEM_MC164
 	/*
 	*	check, if file already exists
 	*/
 	fp = fopen(filename, "r");
 	if(fp) {
-		fclose(fp); 
-		return OV_ERR_FILEALREADYEXISTS;
+		fclose(fp);
+		/*
+		 * if force create is active try to remove old db file
+		 */
+		if(dbFlags&OV_DBOPT_FORCECREATE){
+			if(remove(filename))
+				return OV_ERR_CANTWRITETOFILE;
+		} else {
+			return OV_ERR_FILEALREADYEXISTS;
+		}
 	}
 #endif
 #if OV_SYSTEM_UNIX
@@ -832,7 +891,7 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	*	ensure that we are the first opener of the database file
 	*/
 	if(status != SS$_CREATED) {
-		ov_database_unmap();
+		ov_database_unload();
 		return OV_ERR_CANTCREATEFILE;
 	}
 	/*
@@ -841,6 +900,7 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	Ov_AbortIfNot(size == retaddr[1]-retaddr[0]+1);
 	pdb = (OV_DATABASE_INFO*)retaddr[0];
 #endif
+	}
 	/*
 	*	initialize database structure
 	*/
@@ -863,7 +923,7 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	*	    
 	*/	
 	if(!ml_initialize(pmpinfo, pdb->pstart, ov_database_morecore)) {
-		ov_database_unmap();
+		ov_database_unload();
 		return OV_ERR_DBOUTOFMEMORY;
 	}
 	
@@ -936,7 +996,7 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	*/
 	result = ov_library_load(&pdb->ov, &OV_LIBRARY_DEF_ov);
 	if(Ov_Fail(result)) {
-		ov_database_unmap();
+		ov_database_unload();
 		return result;
 	}
 	/*
@@ -957,34 +1017,19 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_create(
 	
 #endif
 
+	if((dbFlags&OV_DBOPT_VERBOSE)){
+		ov_logfile_info("Database created.");
+	}
+
 	return OV_ERR_OK;
 }
 
 /*	----------------------------------------------------------------------	*/
 
 /*
-*	Map an existing database
+*	load an existing database part 1
 */
-OV_DLLFNCEXPORT OV_RESULT ov_database_map(
-	OV_STRING	filename
-) {
-	/*
-	*	local variables
-	*/
-	OV_RESULT	result;
-
-	result = ov_database_map_loadfile(filename);
-	if (result!=OV_ERR_OK) return result;
-	result = ov_database_map_loadlib(filename);
-	return result;
-}
-
-/*	----------------------------------------------------------------------	*/
-
-/*
-*	Map an existing database part 1
-*/
-OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadfile(
+OV_DLLFNCEXPORT OV_RESULT ov_database_loadfile(
 	OV_STRING	filename
 ) {
 	/*
@@ -1010,17 +1055,39 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadfile(
 	if(!filename) {
 		return OV_ERR_BADPARAM;
 	}
+
+	if((dbFlags&OV_DBOPT_VERBOSE)){
+		if(!(dbFlags&OV_DBOPT_BACKUP)){
+			if(dbFlags&OV_DBOPT_NOMAP){
+				ov_logfile_info("Loading database \"%s\" into memory...", filename);
+			} else {
+				ov_logfile_info("Mapping database \"%s\"...", filename);
+			}
+		} else {
+			if(dbFlags&OV_DBOPT_NOMAP){
+				ov_logfile_info("Loading backup-database \"%s\" into memory...", filename);
+			} else {
+				ov_logfile_info("Mapping backup-database \"%s\"...", filename);
+			}
+		}
+	}
+
+
 #if OV_SYSTEM_UNIX
-	/*
-	*	open the database file
-	*/
-	fd = open((const char*) filename, O_RDWR);
+		/*
+		 *	open the database file
+		 */
+	if(dbFlags&OV_DBOPT_NOMAP){
+		fd = open((const char*) filename, O_RDONLY);
+	} else {
+		fd = open((const char*) filename, O_RDWR);
+	}
 	if(fd == -1) {
 		return OV_ERR_CANTOPENFILE;
 	}
 	/*
-	*	lock the database file
-	*/
+	 *	lock the database file
+	 */
 #if OV_SYSTEM_SOLARIS
 	if(flock_solaris(fd, LOCK_EX)) {
 		close(fd);
@@ -1033,205 +1100,254 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadfile(
 	}
 #endif
 	/*
-	*	read the base address
-	*/
+	 *	read the base address
+	 */
 	if(read(fd, (void*)&baseaddr, sizeof(OV_POINTER)) == -1) {
 		close(fd);
 		return OV_ERR_CANTREADFROMFILE;
 	}
 	/*
-	*	read the filemapping size
-	*/
+	 *	read the filemapping size
+	 */
 	if(read(fd, (void*)&size, sizeof(OV_UINT)) == -1) {
 		close(fd);
 		return OV_ERR_CANTREADFROMFILE;
 	}
 
-	/*
-	*	map the file to memory
-	*/
-#if OV_DATABASE_FLASH | OV_ARCH_NOMMU
-	pdb = (OV_DATABASE_INFO*)mmap(0, size,
-		PROT_READ | PROT_WRITE,	MAP_PRIVATE, fd, 0);
-#else
-	pdb = (OV_DATABASE_INFO*)mmap(baseaddr, size,
-		PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-#endif
-	if(pdb == (OV_DATABASE_INFO*)-1) {
-		pdb = NULL;
+	if(dbFlags&OV_DBOPT_NOMAP){
+
+		OV_UINT pos = 0;
+		OV_UINT nread = 0;
+
+		pdb = Ov_HeapMalloc(size);
+		if(!pdb)
+			return OV_ERR_DBOUTOFMEMORY;
+
+		lseek(fd, 0, SEEK_SET);
+
+		do
+		{
+			nread = read(fd, ((OV_BYTE*)pdb)+pos, size-pos);
+			pos += nread;
+		} while (pos<size && nread);
+
 		close(fd);
-		return OV_ERR_CANTMAPFILE;
-	}
-#endif
-#if OV_SYSTEM_NT
-	/*
-	*	open the database file
-	*/
-	hfile = CreateFile((const char*)filename, GENERIC_READ | GENERIC_WRITE,
-		0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if(hfile == INVALID_HANDLE_VALUE) {
-		return OV_ERR_CANTOPENFILE;
-	}
-	/*
-	*	read the base address
-	*/
-	if(!ReadFile(hfile, (LPVOID)&baseaddr, sizeof(OV_POINTER),
-		&bytesread, NULL)
-	) {
-		CloseHandle(hfile);
-		return OV_ERR_CANTREADFROMFILE;
-	}
-	/*
-	*	read the filemapping size
-	*/
-	if(!ReadFile(hfile, (LPVOID)&size, sizeof(OV_UINT),
-		&bytesread, NULL)
-	) {
-		CloseHandle(hfile);
-		return OV_ERR_CANTREADFROMFILE;
-	}
-	/*
-	*	check file size
-	*/
-	if(GetFileSize(hfile, NULL) != size) {
-		CloseHandle(hfile);
-		return OV_ERR_BADDATABASE;
-	}
-	/*
-	*	create a file mapping object
-	*/
-#if OV_DYNAMIC_DATABASE
-	hmap = CreateFileMapping(hfile, NULL, PAGE_READWRITE,
-		0, OV_DATABASE_MAXSIZE, NULL);
+		fd = 0;
+
+	}else{
+		/*
+		 *	map the file to memory
+		 */
+#if OV_DATABASE_FLASH | OV_ARCH_NOMMU
+		pdb = (OV_DATABASE_INFO*)mmap(0, size,
+				PROT_READ | PROT_WRITE,	MAP_PRIVATE, fd, 0);
 #else
-	hmap = CreateFileMapping(hfile, NULL, PAGE_READWRITE,
-		0, size, NULL);
+		pdb = (OV_DATABASE_INFO*)mmap(baseaddr, size,
+				PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 #endif
-	if(!hmap) {
-		CloseHandle(hfile);
-		return OV_ERR_CANTMAPFILE;
-	}
-	/*
-	*	map the file to memory
-	*/
-	pdb = (OV_DATABASE_INFO*)MapViewOfFileEx(hmap, 
-		FILE_MAP_ALL_ACCESS, 0, 0, 0, (LPVOID)baseaddr);
-	if(!pdb) {
-		pdb = (OV_DATABASE_INFO*)MapViewOfFile(hmap,
-			FILE_MAP_ALL_ACCESS, 0, 0, 0);
-		if(!pdb) {
-			CloseHandle(hmap);
-			CloseHandle(hfile);
+		if(pdb == (OV_DATABASE_INFO*)-1) {
+			pdb = NULL;
+			close(fd);
 			return OV_ERR_CANTMAPFILE;
 		}
 	}
 #endif
+#if OV_SYSTEM_NT
+		/*
+		 *	open the database file
+		 */
+		if(dbFlags&OV_DBOPT_NOMAP){
+			hfile = CreateFile((const char*)filename, GENERIC_READ,
+					0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		} else {
+			hfile = CreateFile((const char*)filename, GENERIC_READ | GENERIC_WRITE,
+					0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		}
+		if(hfile == INVALID_HANDLE_VALUE) {
+			return OV_ERR_CANTOPENFILE;
+		}
+
+		/*
+		 *	read the base address
+		 */
+		if(!ReadFile(hfile, (LPVOID)&baseaddr, sizeof(OV_POINTER),
+				&bytesread, NULL)
+		) {
+			CloseHandle(hfile);
+			return OV_ERR_CANTREADFROMFILE;
+		}
+		/*
+		 *	read the filemapping size
+		 */
+		if(!ReadFile(hfile, (LPVOID)&size, sizeof(OV_UINT),
+				&bytesread, NULL)
+		) {
+			CloseHandle(hfile);
+			return OV_ERR_CANTREADFROMFILE;
+		}
+		/*
+		 *	check file size
+		 */
+		if(GetFileSize(hfile, NULL) != size) {
+			CloseHandle(hfile);
+			return OV_ERR_BADDATABASE;
+		}
+		if(dbFlags&OV_DBOPT_NOMAP){
+
+			if(SetFilePointer(hfile, 0, NULL, FILE_BEGIN)==INVALID_SET_FILE_POINTER)
+				return OV_ERR_CANTREADFROMFILE;
+
+			pdb = Ov_HeapMalloc(size);
+			if(!pdb)
+				return OV_ERR_DBOUTOFMEMORY;
+
+			if(!ReadFile(hfile, (LPVOID)pdb, size, &bytesread, NULL)){
+				Ov_HeapFree(pdb);
+				pdb = NULL;
+				return OV_ERR_CANTREADFROMFILE;
+			}
+
+			CloseHandle(hfile);
+			hfile = NULL;
+
+		} else {
+			/*
+			 *	create a file mapping object
+			 */
+#if OV_DYNAMIC_DATABASE
+			hmap = CreateFileMapping(hfile, NULL, PAGE_READWRITE,
+					0, OV_DATABASE_MAXSIZE, NULL);
+#else
+			hmap = CreateFileMapping(hfile, NULL, PAGE_READWRITE,
+					0, size, NULL);
+#endif
+			if(!hmap) {
+				CloseHandle(hfile);
+				return OV_ERR_CANTMAPFILE;
+			}
+			/*
+			 *	map the file to memory
+			 */
+			pdb = (OV_DATABASE_INFO*)MapViewOfFileEx(hmap,
+					FILE_MAP_ALL_ACCESS, 0, 0, 0, (LPVOID)baseaddr);
+			if(!pdb) {
+				pdb = (OV_DATABASE_INFO*)MapViewOfFile(hmap,
+						FILE_MAP_ALL_ACCESS, 0, 0, 0);
+				if(!pdb) {
+					CloseHandle(hmap);
+					CloseHandle(hfile);
+					return OV_ERR_CANTMAPFILE;
+				}
+			}
+		}
+#endif
 #if OV_SYSTEM_MC164
-	pdb = pdbmem;
+		pdb = pdbmem;
 #endif
 #if OV_SYSTEM_RMOS
-	/*
-	*	open the database file
-	*/
-	file = fopen((const char*)filename, "rb+");
-	if(!file) {
-		return OV_ERR_CANTOPENFILE;
-	}
-	/*
-	*	read the base address
-	*/
-	if(fread((char*)&baseaddr, sizeof(OV_POINTER), 1, file) != 1) {
-		fclose(file);
-		return OV_ERR_CANTREADFROMFILE;
-	}
-	/*
-	*	read the filemapping size
-	*/
-	if(fread((char*)&size, sizeof(OV_UINT), 1, file) != 1) {
-		fclose(file);
-		return OV_ERR_CANTREADFROMFILE;
-	}
-	/*
-	*	get database memory
-	*/
-	pdb = (OV_DATABASE_INFO*)Ov_HeapMalloc(size);
-	if(!pdb) {
-		return OV_ERR_HEAPOUTOFMEMORY;
-	}
-	/*
-	*	read the file to memory
-	*/
-	if(fseek(file, 0, SEEK_SET) < 0) {
-		Ov_HeapFree(pdb);
-		fclose(file);
-		return OV_ERR_CANTREADFROMFILE;
-	}
-	if(fread((char*)pdb, size, 1, file) != 1) {
-		Ov_HeapFree(pdb);
-		fclose(file);
-		return OV_ERR_CANTREADFROMFILE;
-	}
+		/*
+		 *	open the database file
+		 */
+		file = fopen((const char*)filename, "rb+");
+		if(!file) {
+			return OV_ERR_CANTOPENFILE;
+		}
+		/*
+		 *	read the base address
+		 */
+		if(fread((char*)&baseaddr, sizeof(OV_POINTER), 1, file) != 1) {
+			fclose(file);
+			return OV_ERR_CANTREADFROMFILE;
+		}
+		/*
+		 *	read the filemapping size
+		 */
+		if(fread((char*)&size, sizeof(OV_UINT), 1, file) != 1) {
+			fclose(file);
+			return OV_ERR_CANTREADFROMFILE;
+		}
+		/*
+		 *	get database memory
+		 */
+		pdb = (OV_DATABASE_INFO*)Ov_HeapMalloc(size);
+		if(!pdb) {
+			return OV_ERR_HEAPOUTOFMEMORY;
+		}
+		/*
+		 *	read the file to memory
+		 */
+		if(fseek(file, 0, SEEK_SET) < 0) {
+			Ov_HeapFree(pdb);
+			fclose(file);
+			return OV_ERR_CANTREADFROMFILE;
+		}
+		if(fread((char*)pdb, size, 1, file) != 1) {
+			Ov_HeapFree(pdb);
+			fclose(file);
+			return OV_ERR_CANTREADFROMFILE;
+		}
 #endif
 #if OV_SYSTEM_OPENVMS
-	/*
-	*	initialize FAB
-	*/
-	fab = cc$rms_fab;
-	fab.fab$v_ufo = 1;								/* user file open */
-	fab.fab$l_fna = (const char*) filename;			/* filename address */
-	fab.fab$b_fns = strlen(filename);				/* filename size */
-	fab.fab$v_upd = 1;								/* update access */
-	/*
-	*	open database file
-	*/
-	status = sys$open(&fab);
-	if(!(status & 1)) {
-		return OV_ERR_CANTOPENFILE;
-	}
-	/*
-	*	get channel from the FAB
-	*/
-	channel = fab.fab$l_stv;
-	/*
-	*	initialize address hint: just an address in P0 space
-	*/
-	inaddr[0] = inaddr[1] = NULL;
-	/*
-	*	map the file to memory
-	*/
-	status = sys$crmpsc(inaddr, retaddr, 0, SEC$M_WRT | SEC$M_EXPREG,
-		0, 0, 0, channel, 0, 0, 0, 0);
-	if(!(status & 1)) {
-		sys$dassgn(channel);
-		return OV_ERR_CANTMAPFILE;
-	}
+		/*
+		 *	initialize FAB
+		 */
+		fab = cc$rms_fab;
+		fab.fab$v_ufo = 1;								/* user file open */
+		fab.fab$l_fna = (const char*) filename;			/* filename address */
+		fab.fab$b_fns = strlen(filename);				/* filename size */
+		fab.fab$v_upd = 1;								/* update access */
+		/*
+		 *	open database file
+		 */
+		status = sys$open(&fab);
+		if(!(status & 1)) {
+			return OV_ERR_CANTOPENFILE;
+		}
+		/*
+		 *	get channel from the FAB
+		 */
+		channel = fab.fab$l_stv;
+		/*
+		 *	initialize address hint: just an address in P0 space
+		 */
+		inaddr[0] = inaddr[1] = NULL;
+		/*
+		 *	map the file to memory
+		 */
+		status = sys$crmpsc(inaddr, retaddr, 0, SEC$M_WRT | SEC$M_EXPREG,
+				0, 0, 0, channel, 0, 0, 0, 0);
+		if(!(status & 1)) {
+			sys$dassgn(channel);
+			return OV_ERR_CANTMAPFILE;
+		}
 #if 0	/* how??? */
-	/*
-	*	ensure that we are the first opener of the database file
-	*/
-	if(status != SS$_CREATED) {
-		ov_database_unmap();
-		return OV_ERR_CANTOPENFILE;
-	}
+		/*
+		 *	ensure that we are the first opener of the database file
+		 */
+		if(status != SS$_CREATED) {
+			ov_database_unload();
+			return OV_ERR_CANTOPENFILE;
+		}
 #endif
-	/*
-	*	assign database pointer and database size
-	*/
-	pdb = (OV_DATABASE_INFO*)retaddr[0];
-	size = retaddr[1]-retaddr[0]+1;
+		/*
+		 *	assign database pointer and database size
+		 */
+		pdb = (OV_DATABASE_INFO*)retaddr[0];
+		size = retaddr[1]-retaddr[0]+1;
 #endif
+
 	/*
 	*	test if we got the same filemapping size
 	*/
 	if (!pdb) {
-		ov_database_unmap();
+		ov_database_unload();
 		return OV_ERR_BADDATABASE;
 	}
 #if OV_SYSTEM_MC164
 	/* nothing to do */
 #else
 	if(size != pdb->size) {
-		ov_database_unmap();
+		ov_database_unload();
 		return OV_ERR_BADDATABASE;
 	}
 #endif
@@ -1241,7 +1357,7 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadfile(
 	if((OV_POINTER)pdb != pdb->baseaddr) {
 		result = ov_database_move((OV_BYTE*)pdb-(OV_BYTE*)(pdb->baseaddr));
 		if(Ov_Fail(result)) {
-			ov_database_unmap();
+			ov_database_unload();
 			return result;
 		}
 	}
@@ -1249,18 +1365,27 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadfile(
 	*	restart the database memory pool
 	*/
 	if(!ml_restart(pmpinfo, pdb->pstart, ov_database_morecore)) {
-		ov_database_unmap();
+		ov_database_unload();
 		return OV_ERR_BADDATABASE;
 	}
+
+	if((dbFlags&OV_DBOPT_VERBOSE)){
+		if(dbFlags&OV_DBOPT_NOMAP){
+			ov_logfile_info("Database loaded.");
+		} else {
+			ov_logfile_info("Database mapped.");
+		}
+	}
+
 	return OV_ERR_OK;
 }
 
 /*	----------------------------------------------------------------------	*/
 
 /*
-*	Map an existing database part 2
+*	load an existing database part 2
 */
-OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadlib(
+OV_DLLFNCEXPORT OV_RESULT ov_database_loadlib(
 	OV_STRING	filename
 ) {
 	/*
@@ -1290,7 +1415,7 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_map_loadlib(
 /*
 *	Unmap the database
 */
-OV_DLLFNCEXPORT void ov_database_unmap(void) {
+OV_DLLFNCEXPORT void ov_database_unload(void) {
 	/*
 	*	local variables
 	*/
@@ -1304,6 +1429,13 @@ OV_DLLFNCEXPORT void ov_database_unmap(void) {
 	*	shut down database if not already done
 	*/
 	if (pdb)	ov_database_shutdown();
+
+	if(dbFlags&(OV_DBOPT_NOMAP|OV_DBOPT_NOFILE)){
+		Ov_HeapFree(pdb);
+	} else {
+		if(dbFlags&OV_DBOPT_VERBOSE){
+			ov_logfile_info("Unmapping database ...");
+		}
 #if OV_SYSTEM_UNIX
 	/*
 	*	unmap the file and close it
@@ -1342,7 +1474,18 @@ OV_DLLFNCEXPORT void ov_database_unmap(void) {
 	}
 	if (channel) sys$dassgn(channel);
 #endif
+	}
+
 	pdb = NULL;
+
+	if((dbFlags&OV_DBOPT_VERBOSE)){
+		if (dbFlags&(OV_DBOPT_NOMAP|OV_DBOPT_NOFILE)){
+			ov_logfile_info("Database freed.");
+		}else {
+			ov_logfile_info("Database unmapped.");
+		}
+	}
+
 	ov_vendortree_setdatabasename(NULL);
 }
 
@@ -1355,6 +1498,10 @@ OV_DLLFNCEXPORT void ov_database_flush(void) {
 	/*
 	*	local variables
 	*/
+
+	if(dbFlags&(OV_DBOPT_NOMAP|OV_DBOPT_NOFILE))
+		return;
+
 #if OV_SYSTEM_OPENVMS
 	OV_BYTE	*inaddr[2];
 #endif
@@ -1430,6 +1577,50 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_write(OV_STRING dbname) {
 /*	----------------------------------------------------------------------	*/
 
 /*
+*	Load database
+*/
+OV_DLLFNCEXPORT OV_RESULT ov_database_load(
+	OV_STRING	filename,
+	OV_UINT		size,
+	OV_UINT		flags
+) {
+	dbFlags = flags;
+	OV_RESULT	result;
+
+	if(ov_string_compare(filename, "-")==OV_STRCMP_EQUAL){
+		dbFlags |= OV_DBOPT_NOFILE;
+	}
+
+#if OV_DYNAMIC_DATABASE
+	/*
+	 * dynamic database needs mapped file
+	 */
+	if(dbFlags&(OV_DBOPT_NOFILE|OV_DBOPT_NOMAP))
+		return OV_ERR_BADPARAM;
+#endif
+
+#if !(OV_SYSTEM_UNIX || OV_SYSTEM_NT)
+	/*
+	 * NOFILE and NOMAP only supported for Unix and NT
+	 */
+	if(dbFlags&(OV_DBOPT_NOFILE|OV_DBOPT_NOMAP))
+		return OV_ERR_BADPARAM;
+#endif
+
+	if((dbFlags&OV_DBOPT_FORCECREATE)	||
+		(dbFlags&OV_DBOPT_NOFILE)){
+		result = ov_database_create(filename, size, 0);
+	} else {
+		result = ov_database_loadfile(filename);
+		if (Ov_Fail(result)) return result;
+		result = ov_database_loadlib(filename);
+	}
+
+	return result;
+}
+/*	----------------------------------------------------------------------	*/
+
+/*
 *	Initialize the database (subroutine)
 */
 void ov_database_init(void) {
@@ -1450,7 +1641,7 @@ void ov_database_init(void) {
 			*/
 			plib->v_handle = 0;
 			/*
-			*	Iterate over all associations of the libray
+			*	Iterate over all associations of the library
 			*/
 			Ov_ForEachChildEx(ov_containment, plib, passoc, ov_association) {
 				/*
@@ -1461,7 +1652,7 @@ void ov_database_init(void) {
 				passoc->v_getaccessfnc = NULL;
 			}	/* associations */
 			/*
-			*	Iterate over all classes of the libray
+			*	Iterate over all classes of the library
 			*/
 			Ov_ForEachChildEx(ov_containment, plib, pclass, ov_class) {
 				/*
@@ -1512,6 +1703,11 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_startup(void) {
 		pdb->root.v_objectstate &= ~OV_OS_STARTED;
 		return OV_ERR_BADDATABASE;
 	}
+
+	if(dbFlags&OV_DBOPT_VERBOSE){
+		ov_logfile_info("Starting up database...");
+	}
+
 	/*
 	*	open and compare all libraries 
 	*/
@@ -1533,6 +1729,10 @@ OV_DLLFNCEXPORT OV_RESULT ov_database_startup(void) {
 	/*
 	*	library is started
 	*/
+	if(dbFlags&OV_DBOPT_VERBOSE){
+		ov_logfile_info("Database started up.");
+	}
+	database_mutex_init();
 	pdb->started = TRUE;
 	return OV_ERR_OK;
 }
@@ -1551,10 +1751,13 @@ OV_DLLFNCEXPORT void ov_database_shutdown(void) {
 	*	shut down database
 	*/
 	if(pdb->started) {
-        /*
-        *	Flush the contents of a database
-        */
-	    ov_database_flush();
+		if(dbFlags&OV_DBOPT_VERBOSE){
+			ov_logfile_info("Shutting down database...");
+		}
+		/*
+		 *	Flush the contents of a database
+		 */
+		ov_database_flush();
 		/*
 		*	call shutdown method of root object
 		*/
@@ -1565,7 +1768,12 @@ OV_DLLFNCEXPORT void ov_database_shutdown(void) {
 		Ov_ForEachChildEx(ov_instantiation, pclass_ov_library, plib, ov_library) {
 			ov_library_close(plib);
 		}
+		database_mutex_destroy();
 		pdb->started = FALSE;
+
+		if(dbFlags&OV_DBOPT_VERBOSE){
+			ov_logfile_info("Database shut down.");
+		}
 	}
 }
 
@@ -1577,13 +1785,17 @@ OV_DLLFNCEXPORT void ov_database_shutdown(void) {
 OV_DLLFNCEXPORT OV_POINTER ov_database_malloc(
 	OV_UINT		size
 ) {
+	__ml_ptr ptmp = NULL;
 #ifdef OV_VALGRIND
     if (ov_path_getobjectpointer("/acplt/malloc", 2)) {
 		return malloc(size);
 	}
 #endif
 	if(pdb) {
-		return ml_malloc(size);
+		database_mutex_lock();
+		ptmp = ml_malloc(size);
+		database_mutex_unlock();
+		return ptmp;
 	}
 	return NULL;
 }
@@ -1597,6 +1809,7 @@ OV_DLLFNCEXPORT OV_POINTER ov_database_realloc(
 	OV_POINTER	ptr,
 	OV_UINT		size
 ) {
+	__ml_ptr ptmp = NULL;
 #ifdef OV_VALGRIND
 	if(pdb && ptr != 0 && ov_path_getobjectpointer("/acplt/malloc", 2)==NULL){
 		if(!((uintptr_t)ptr >= (uintptr_t)pdb->baseaddr && (uintptr_t)ptr <= (uintptr_t)pdb->baseaddr+(uintptr_t)pdb->size)){
@@ -1612,7 +1825,10 @@ OV_DLLFNCEXPORT OV_POINTER ov_database_realloc(
 	}
 #endif
 	if(pdb) {
-		return ml_realloc(ptr, size);
+		database_mutex_lock();
+		ptmp = ml_realloc(ptr, size);
+		database_mutex_unlock();
+		return ptmp;
 	}
 	return NULL;
 }
@@ -1641,7 +1857,9 @@ OV_DLLFNCEXPORT void ov_database_free(
 	}
 #endif
 	if(pdb) {
+		database_mutex_lock();
 		ml_free(ptr);
+		database_mutex_unlock();
 	}
 }
 
@@ -1664,13 +1882,15 @@ OV_DLLFNCEXPORT OV_UINT ov_database_getsize(void) {
 */
 OV_DLLFNCEXPORT OV_UINT ov_database_getfree(void) {
 	if(pdb) {
-		#ifdef _STDINT_H
-			uintptr_t free;
-		#else
-			OV_UINT free;
-			#define uintptr_t OV_UINT
-		#endif
+#ifdef _STDINT_H
+		uintptr_t free;
+#else
+		OV_UINT free;
+#define uintptr_t OV_UINT
+#endif
+		database_mutex_lock();
 		free = (uintptr_t)pdb->pend - (uintptr_t)pdb->pcurr + (uintptr_t)pmpinfo->bytes_free;
+		database_mutex_unlock();
 		if(free > OV_VL_MAXUINT){
 			return OV_VL_MAXUINT;
 		}
@@ -1691,7 +1911,9 @@ OV_DLLFNCEXPORT OV_UINT ov_database_getused(void) {
 		OV_UINT used;
 	#endif
 	if(pdb) {
+		database_mutex_lock();
 		used = (uintptr_t)pdb->pstart - (uintptr_t)pdb->baseaddr + (uintptr_t)pmpinfo->bytes_used - (uintptr_t)pmpinfo->bytes_free;
+		database_mutex_unlock();
 		if(used > OV_VL_MAXUINT){
 			return OV_VL_MAXUINT;
 		}
@@ -1733,6 +1955,7 @@ OV_DLLFNCEXPORT OV_UINT ov_database_getfrag(void) {
 		*	find out how many blocks of the average size there are
 		*/
 		sum = 0;
+		database_mutex_lock();
 		for(i=logavgsize; i<BLOCKLOG; i++) {
 			num = 0;
 			for(pnext = pmpinfo->fraghead[i].next; pnext; pnext=pnext->next) {
@@ -1740,6 +1963,7 @@ OV_DLLFNCEXPORT OV_UINT ov_database_getfrag(void) {
 			}
 			sum += num*(1<<(i-logavgsize));
 		}
+		database_mutex_unlock();
 		sum += (pdb->pend-pdb->pcurr)/avgsize;
 		return ((ov_database_getfree()-sum*avgsize)*100)/ov_database_getfree();
 	}
@@ -1769,7 +1993,7 @@ OV_DLLFNCEXPORT OV_UINT ov_database_getfrag(void) {
 *
 */
 OV_RESULT ov_database_move(
-	const OV_INT	distance
+	const OV_PTRDIFF	distance
 ) {
 	/*
 	*	local variables
